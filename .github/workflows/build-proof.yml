@@ -1,0 +1,74 @@
+name: build-proof
+
+# Phase-0 proof: can VyOS be source-built for a given arch on a GitHub-hosted runner?
+# amd64 -> ubuntu-latest ; arm64 -> free hosted ubuntu-24.04-arm (native, no QEMU).
+# Builds the ISO and uploads it as an artifact. No publish yet — this just answers
+# "does the build succeed", especially for arm64 (the unproven assumption).
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "vyos-build branch (rolling = current)"
+        default: "current"
+        type: string
+      arch:
+        description: "target architecture"
+        default: "arm64"
+        type: choice
+        options: ["arm64", "amd64"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 150
+    # Inputs go through env (never interpolated straight into run: shells).
+    env:
+      BRANCH: ${{ inputs.branch }}
+      ARCH: ${{ inputs.arch }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Runner facts
+        run: |
+          echo "host_arch=$(uname -m)  branch=${BRANCH}  target=${ARCH}"
+          docker --version
+
+      - name: Free up disk space (VyOS ISO build is large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /opt/hostedtoolcache 2>/dev/null || true
+          df -h /
+
+      - name: Clone vyos-build
+        run: git clone --depth 1 -b "${BRANCH}" --single-branch https://github.com/vyos/vyos-build.git
+
+      - name: Build the vyos-build container for this arch (native)
+        working-directory: vyos-build
+        run: docker build -t vyos-build:local docker/
+
+      - name: Build the VyOS ISO
+        working-directory: vyos-build
+        run: |
+          docker run --rm --privileged \
+            -v "$(pwd)":/vyos -w /vyos vyos-build:local \
+            sudo ./build-vyos-image generic \
+              --architecture "${ARCH}" \
+              --build-type release \
+              --version "${BRANCH}-${ARCH}-${RUN_NUMBER}" \
+              --build-by "ci@vyos-container"
+
+      - name: Inspect result
+        working-directory: vyos-build
+        run: |
+          ls -lh build/*.iso
+          file build/*.iso
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-${{ inputs.branch }}-${{ inputs.arch }}-iso
+          path: vyos-build/build/*.iso
+          if-no-files-found: error
+          retention-days: 7
