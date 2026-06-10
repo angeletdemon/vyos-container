@@ -1,0 +1,59 @@
+name: emulation-test
+
+# Does the amd64 VyOS image boot under QEMU emulation on a real arm64 host?
+# Stand-in for the user's M3/Pi (both arm64). Registers amd64 binfmt, runs the
+# amd64 image with --platform linux/amd64, and times how long systemd takes to
+# come up (or whether it hangs).
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "image to test"
+        default: "ghcr.io/angeletdemon/vyos:rolling"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  emulate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    env:
+      IMAGE: ${{ inputs.image }}
+    steps:
+      - name: Host facts
+        run: |
+          echo "host_arch=$(uname -m)  (expect aarch64)"
+          nproc; free -h | head -2
+
+      - name: Register amd64 emulation (QEMU binfmt)
+        run: docker run --privileged --rm tonistiigi/binfmt --install amd64
+
+      - name: Pull the amd64 image
+        run: docker pull --platform linux/amd64 "$IMAGE"
+
+      - name: Boot VyOS under emulation + time systemd
+        run: |
+          start=$(date +%s)
+          docker run -d --name vyos --privileged --platform linux/amd64 "$IMAGE"
+          state="(none)"
+          for i in $(seq 1 36); do
+            state="$(docker exec vyos systemctl is-system-running 2>/dev/null || true)"
+            now=$(date +%s)
+            echo "  t=$((now-start))s  state=${state:-<starting>}"
+            { [ "$state" = running ] || [ "$state" = degraded ]; } && break
+            sleep 10
+          done
+          echo "FINAL state=$state after $(( $(date +%s) - start ))s"
+          { [ "$state" = running ] || [ "$state" = degraded ]; } || { echo "::warning::VyOS did not reach running under emulation"; }
+
+      - name: Try a VyOS op-mode command under emulation
+        run: |
+          echo "--- show version (emulated) ---"
+          timeout 120 docker exec vyos vbash -ic "show version" 2>&1 | head -15 || echo "(op-mode command timed out/failed under emulation)"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f vyos 2>/dev/null || true
