@@ -10,11 +10,11 @@ NODE=clab-vyos-smoke-r1
 
 if command -v podman >/dev/null; then EXEC="sudo podman exec"; else EXEC="docker exec"; fi
 
-cleanup() { sudo containerlab destroy -t "$TOPO" --cleanup >/dev/null 2>&1 || true; }
+cleanup() { sudo containerlab destroy -t "$TOPO" --runtime podman --cleanup >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 echo "[*] deploy ($IMAGE)"
-sudo -E containerlab deploy -t "$TOPO" --reconfigure
+sudo -E containerlab deploy -t "$TOPO" --runtime podman --reconfigure
 
 echo "[*] wait for system-running (up to 120s)"
 state=""
@@ -27,7 +27,8 @@ echo "    state=$state"
 { [ "$state" = "running" ] || [ "$state" = "degraded" ]; } || { echo "FAIL: not healthy"; exit 1; }
 
 echo "[*] assert injected config loaded (marker host-name vyos-smoketest)"
-if $EXEC "$NODE" su - admin -c "show configuration commands" 2>/dev/null | grep -q "vyos-smoketest"; then
+# VyOS op-mode must run under vbash -i (a login shell loses the op-mode env).
+if $EXEC "$NODE" vbash -ic "show configuration commands" 2>/dev/null | grep -q "vyos-smoketest"; then
   echo "PASS: startup-config applied"
 else
   echo "FAIL: marker not found"; exit 1

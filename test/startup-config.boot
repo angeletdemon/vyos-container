@@ -8,8 +8,3 @@ system {
         }
     }
 }
-interfaces {
-    ethernet eth1 {
-        address 198.51.100.2/24
-    }
-}
