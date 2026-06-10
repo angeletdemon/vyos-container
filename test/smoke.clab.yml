@@ -1,0 +1,7 @@
+name: vyos-smoke
+topology:
+  nodes:
+    r1:
+      kind: vyosnetworks/vyos
+      image: ${IMAGE:-localhost/vyos:rolling-test}
+      startup-config: startup-config.boot

@@ -1,0 +1,9 @@
+# build artifacts
+*.iso
+*.iso.minisig
+rootfs.tar
+build/_work/
+# containerlab runtime
+clab-*/
+.tls/
+*.log

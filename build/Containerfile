@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+FROM scratch
+ADD rootfs.tar /
+# Mask units that misbehave in a container; disable the Kea DHCP-DDNS server.
+# NOTE: current VyOS rolling names this unit 'isc-kea-dhcp-ddns-server.service'
+# (ContainerLab's example doc still says 'kea-dhcp-ddns-server.service', which no
+# longer exists -> verified absent in vyos-2026.06.10 rootfs). Disable defensively
+# so a future rename degrades gracefully instead of failing the build.
+RUN for unit in getty.target auditd.service ; do systemctl mask "$unit" ; done && \
+    ( systemctl disable isc-kea-dhcp-ddns-server.service 2>/dev/null || true )
+HEALTHCHECK --start-period=10s CMD systemctl is-system-running || exit 1
+LABEL org.opencontainers.image.title="vyos (unofficial)" \
+      org.opencontainers.image.description="Unofficial ContainerLab-ready VyOS, built from official ISO" \
+      org.opencontainers.image.source="https://github.com/angeletdemon/vyos-container"
+CMD ["/sbin/init"]
