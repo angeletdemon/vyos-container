@@ -8,26 +8,29 @@
 #
 # Two VyOS routers (bcr/fcr, like the Module-1 Aristas) with a host behind each,
 # static-routed so the hosts reach each other end-to-end (working, not broken).
-# Both routers enforce **key-only SSH** (password auth disabled) using your pubkey.
+# Both routers enforce **key-only SSH** (password auth disabled) using your pubkey;
+# the hosts also accept your key (root) so you can SSH into every node.
 #
-# Then it asserts: routers boot, config loaded, keyed SSH works, password SSH is
-# REJECTED, and host-a <-> host-b ping succeeds through both routers.
+# After the checks it LEAVES THE LAB RUNNING and prints how to log into each node
+# plus the teardown command — so you can poke around first.
 #
 # Usage:
 #   ./validate.sh                 # use local image if present, else pull
 #   CLEAN_PULL=1 ./validate.sh    # logout + wipe local + anonymous pull first
-#   KEEP=1 ./validate.sh          # leave the lab running for poking around
+#   TEARDOWN=1 ./validate.sh      # destroy the lab automatically at the end (CI mode)
 #   IMAGE=quay.io/slashvar/vyos:rolling ./validate.sh   # test a different registry/tag
 set -euo pipefail
 
 # ---- knobs (override via env) -----------------------------------------------
 IMAGE="${IMAGE:-ghcr.io/angeletdemon/vyos:rolling}"
-HOST_IMAGE="${HOST_IMAGE:-docker.io/wbitt/network-multitool:latest}"   # any pingable linux; swap to localhost/lab-host:latest
+HOST_IMAGE="${HOST_IMAGE:-localhost/lab-host:latest}"   # the repo's UBI9 lab host; swap via HOST_IMAGE
 SSH_PUBKEY="${SSH_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 CLEAN_PULL="${CLEAN_PULL:-0}"
-KEEP="${KEEP:-0}"
+TEARDOWN="${TEARDOWN:-0}"
 LABNAME="vyos-validate"
+RUNDIR="${RUNDIR:-$HOME/.vyos-validate-lab}"
+TOPO="$RUNDIR/topo.clab.yml"
 PODMAN="sudo podman"
 
 # ---- helpers ----------------------------------------------------------------
@@ -35,18 +38,13 @@ PASS=0; FAIL=0
 ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); }
 info() { printf '\033[36m[*]\033[0m %s\n' "$1"; }
-
-WORKDIR="$(mktemp -d "/tmp/${LABNAME}.XXXXXX")"
-TOPO="$WORKDIR/topo.clab.yml"
+mgmt_ip() { $PODMAN inspect "$1" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null | awk '{print $1}'; }
 
 cleanup() {
-  if [ "$KEEP" = "1" ]; then
-    info "KEEP=1 — leaving the lab running. Destroy with:"
-    echo "    sudo containerlab destroy -t $TOPO --runtime podman --cleanup"
-  else
-    info "tearing down"
+  if [ "$TEARDOWN" = "1" ]; then
+    info "TEARDOWN=1 — destroying the lab"
     sudo containerlab destroy -t "$TOPO" --runtime podman --cleanup >/dev/null 2>&1 || true
-    rm -rf "$WORKDIR"
+    rm -rf "$RUNDIR"
   fi
 }
 trap cleanup EXIT
@@ -63,13 +61,16 @@ PUBKEY_DATA="$(awk '{print $2}' "$SSH_PUBKEY")"
 # ---- image -----------------------------------------------------------------
 if [ "$CLEAN_PULL" = "1" ]; then
   info "CLEAN_PULL=1 — anonymous fresh pull of $IMAGE"
-  reg="${IMAGE%%/*}"
-  $PODMAN logout "$reg" >/dev/null 2>&1 || true
+  $PODMAN logout "${IMAGE%%/*}" >/dev/null 2>&1 || true
   $PODMAN rmi -f "$IMAGE" >/dev/null 2>&1 || true
 fi
 info "ensuring images are present"
 $PODMAN image exists "$IMAGE" || $PODMAN pull "$IMAGE"
-$PODMAN image exists "$HOST_IMAGE" || $PODMAN pull "$HOST_IMAGE"
+$PODMAN image exists "$HOST_IMAGE" || { echo "host image missing: $HOST_IMAGE (build it or set HOST_IMAGE=)"; exit 1; }
+
+# ---- lab dir + host authorized_keys (lets you SSH root@host too) ------------
+mkdir -p "$RUNDIR"
+install -m 0644 "$SSH_PUBKEY" "$RUNDIR/authorized_keys"
 
 # ---- generate VyOS router configs (partial config.boot; clab merges mgmt eth0 + its own key) ----
 gen_router() {  # name eth1cidr eth2cidr route_dest route_nexthop outfile
@@ -111,8 +112,8 @@ system {
 }
 EOF
 }
-gen_router bcr "10.10.1.1/24" "10.0.0.1/30" "10.20.1.0/24" "10.0.0.2" "$WORKDIR/bcr.config.boot"
-gen_router fcr "10.20.1.1/24" "10.0.0.2/30" "10.10.1.0/24" "10.0.0.1" "$WORKDIR/fcr.config.boot"
+gen_router bcr "10.10.1.1/24" "10.0.0.1/30" "10.20.1.0/24" "10.0.0.2" "$RUNDIR/bcr.config.boot"
+gen_router fcr "10.20.1.1/24" "10.0.0.2/30" "10.10.1.0/24" "10.0.0.1" "$RUNDIR/fcr.config.boot"
 
 # ---- topology --------------------------------------------------------------
 cat > "$TOPO" <<EOF
@@ -130,12 +131,14 @@ topology:
     host-a:
       kind: linux
       image: $HOST_IMAGE
+      binds: [ "authorized_keys:/root/.ssh/authorized_keys:ro" ]
       exec:
         - ip addr add 10.10.1.10/24 dev eth1
         - ip route add default via 10.10.1.1
     host-b:
       kind: linux
       image: $HOST_IMAGE
+      binds: [ "authorized_keys:/root/.ssh/authorized_keys:ro" ]
       exec:
         - ip addr add 10.20.1.10/24 dev eth1
         - ip route add default via 10.20.1.1
@@ -147,7 +150,7 @@ EOF
 
 # ---- deploy ----------------------------------------------------------------
 info "deploying $LABNAME (image: $IMAGE)"
-( cd "$WORKDIR" && sudo containerlab deploy -t "$TOPO" --runtime podman --reconfigure )
+( cd "$RUNDIR" && sudo containerlab deploy -t "$TOPO" --runtime podman --reconfigure )
 
 N_BCR="clab-${LABNAME}-bcr"; N_FCR="clab-${LABNAME}-fcr"
 N_HA="clab-${LABNAME}-host-a"; N_HB="clab-${LABNAME}-host-b"
@@ -164,24 +167,22 @@ wait_running() {  # container -> 0 when systemd is (degraded|running)
 
 echo; info "=== TESTS ==="
 
-# 1-2. routers boot
+# routers boot
 wait_running "$N_BCR" && ok "bcr: VyOS booted (systemd running)" || bad "bcr did not reach running"
 wait_running "$N_FCR" && ok "fcr: VyOS booted (systemd running)" || bad "fcr did not reach running"
 
-# 3-4. config loaded (interface address present)
+# config loaded
 $PODMAN exec "$N_BCR" vbash -ic "show configuration commands" 2>/dev/null | grep -q "eth1 address '10.10.1.1/24'" \
   && ok "bcr: startup-config loaded (eth1 10.10.1.1/24)" || bad "bcr: expected interface config missing"
 $PODMAN exec "$N_FCR" vbash -ic "show configuration commands" 2>/dev/null | grep -q "eth1 address '10.20.1.1/24'" \
   && ok "fcr: startup-config loaded (eth1 10.20.1.1/24)" || bad "fcr: expected interface config missing"
 
-# SSH: keyed auth works + password auth rejected, on BOTH routers.
-# NB: op-mode commands (show ...) need an interactive shell, so the auth probe
-# runs a plain 'echo' — a returned marker proves key login + command exec.
+# SSH: keyed auth works + password rejected, on BOTH routers.
+# NB: op-mode commands (show ...) need an interactive shell, so the auth probe runs 'echo'.
 SSH_BASE=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes)
-sleep 5  # let sshd settle
+sleep 5
 test_ssh() {  # label container
-  local name="$1" c="$2" ip
-  ip="$($PODMAN inspect "$c" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' | awk '{print $1}')"
+  local name="$1" c="$2" ip; ip="$(mgmt_ip "$c")"
   if ssh -i "$SSH_KEY" -o IdentitiesOnly=yes "${SSH_BASE[@]}" "admin@${ip}" 'echo VYOS_SSH_OK' 2>/dev/null | grep -q VYOS_SSH_OK; then
     ok "$name: keyed SSH login works (key-only, $ip)"
   else
@@ -196,7 +197,7 @@ test_ssh() {  # label container
 test_ssh bcr "$N_BCR"
 test_ssh fcr "$N_FCR"
 
-# 7-8. data plane: host-a <-> host-b through both routers
+# data plane: host-a <-> host-b through both routers
 $PODMAN exec "$N_HA" ping -c 2 -W 2 10.20.1.10 >/dev/null 2>&1 \
   && ok "host-a -> host-b (10.20.1.10) ping OK through bcr+fcr" || bad "host-a -> host-b ping failed"
 $PODMAN exec "$N_HB" ping -c 2 -W 2 10.10.1.10 >/dev/null 2>&1 \
@@ -206,8 +207,23 @@ $PODMAN exec "$N_HB" ping -c 2 -W 2 10.10.1.10 >/dev/null 2>&1 \
 echo
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[32m=== ALL %d CHECKS PASSED — the published VyOS image works in ContainerLab ===\033[0m\n' "$PASS"
-  exit 0
 else
   printf '\033[31m=== %d passed, %d FAILED ===\033[0m\n' "$PASS" "$FAIL"
-  exit 1
 fi
+
+# ---- explore (lab left running) --------------------------------------------
+if [ "$TEARDOWN" != "1" ]; then
+  echo
+  info "Lab is LEFT RUNNING — log into each node and look around:"
+  printf '    %-7s VyOS router  ssh -i %s admin@%s   |  sudo podman exec -it %s su - admin\n' "bcr"    "$SSH_KEY" "$(mgmt_ip "$N_BCR")" "$N_BCR"
+  printf '    %-7s VyOS router  ssh -i %s admin@%s   |  sudo podman exec -it %s su - admin\n' "fcr"    "$SSH_KEY" "$(mgmt_ip "$N_FCR")" "$N_FCR"
+  printf '    %-7s linux host   ssh -i %s root@%s    |  sudo podman exec -it %s bash\n'        "host-a" "$SSH_KEY" "$(mgmt_ip "$N_HA")"  "$N_HA"
+  printf '    %-7s linux host   ssh -i %s root@%s    |  sudo podman exec -it %s bash\n'        "host-b" "$SSH_KEY" "$(mgmt_ip "$N_HB")"  "$N_HB"
+  echo
+  info "Try inside a router:  show interfaces  |  show ip route  |  ping 10.20.1.10"
+  info "Tear down when you're done:"
+  printf '    \033[33msudo containerlab destroy -t %s --runtime podman --cleanup\033[0m\n' "$TOPO"
+  echo  "    (or re-run with TEARDOWN=1 ./validate.sh to auto-destroy)"
+fi
+
+[ "$FAIL" -eq 0 ]
